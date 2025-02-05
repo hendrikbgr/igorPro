@@ -30,8 +30,8 @@ const unsigned long inactivityTimeout = 60000;  // 60 seconds
 // (Replace these with your actual Spotify app values.)
 const char* SPOTIFY_CLIENT_ID = "892d24efb7be46eda64b117e84746469";
 const char* SPOTIFY_CLIENT_SECRET = "efc676374890412bb6dc7ae163f41539";
-String spotifyRefreshToken = "AQDn5CQ1ZSgR0vr03yCfr1zoCUJZaMeHHJKPJchF-b_q-OkUYEAtSdDOgTWcXVqlFk3OtW3NtpxZDiVIM8eHN0bs2M6WoPjn4WGRTypG89HcTEhdnxgpzMZg3269QZD3Ors";
-String spotifyAccessToken = "BQBu-O3IIOdIYLSIWNcAC-S4bepd7Ad7WSlMzSB7S9pjRlZfB0KMamXb27xUMogJZvhSNof5Zgjx5dEVf8QoSoHqomRTyPdijW9UMYK3d3JtbXR33mYBW5YkXqtqPqAPmSTgTzBY96Dg87MY2gJfIhi74K4jR3CayGUohHaJXGG309vUpcNvB0AFhHTA7VusE2xlRGcWqdVqKkXPqq-5UV33moBt";
+String spotifyRefreshToken = "AQCMGTFloIHfB8cpiOMvbkwPjCOMwb2-qK4Vz4r67ggeHLrhPHNxlFzbeM09g8wLH-vcNUSvhJNs4o8cgD06aCJJmhTJW9Azk_ddJlJ5OqxqATqvh7ovNg-5x0fw5ltJPJ0";
+String spotifyAccessToken = "BQAIsudP40J5_sGohrmzWF2Iz-5xcQRk_pTzNQ5VAkbJ7dFUxR70mLfKcBxpPcXCrnxRz0VEjQLBgsaPe4aiBacCVitOFvmStsbw72kml7c48gpBeky7TrgtqjCfIdMljM-JX7CQOLoC0WVrIAY8OQg8IHQHKJHiwMmpsmguW7-neUlxO3tNsi_9BOPfLJgl0_aK5oUhzbpVFaGPulAdj9H3jEo9";
 unsigned long spotifyTokenExpiry = 0;  // timestamp (millis) when token expires
 
 // For controlling how often we fetch Spotify data:
@@ -648,6 +648,10 @@ void fetchSpotifyData() {
         spotifyIsPlaying = doc["is_playing"].as<bool>();
       }
     }
+  }
+  if (httpCode == 401) {
+    Serial.println("Spotify token expired. Refreshing token...");
+    refreshSpotifyToken();
   } else {
     Serial.print("Spotify GET failed: ");
     Serial.println(http.errorToString(httpCode));
