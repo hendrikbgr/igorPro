@@ -1,18 +1,20 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
+#include <base64.h>  // Ensure you have a Base64 library available
+#include <ArduinoJson.h> // Install ArduinoJson v6 or later
 
 // ----- WiFi & NTP Settings -----
 const char* ssid = "Telecable_okibng";
 const char* password = "yfrpuGDR";
-// To get Madrid time correctly (e.g., 17:40 instead of 16:40), we force standard time = UTC+2.
-  
+// To get Madrid time correctly, we use the proper TZ string for Madrid.
+
 // ----- OLED Settings -----
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-// D4 is used as the OLED reset (and also the button pin if wired accordingly)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, D4);
 
 // ----- Pin Definitions for Rotary Encoder & Button -----
@@ -24,9 +26,32 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, D4);
 unsigned long lastInputTime = 0;
 const unsigned long inactivityTimeout = 60000;  // 60 seconds
 
+// ----- Spotify Credentials & Token Data -----
+// (Replace these with your actual Spotify app values.)
+const char* SPOTIFY_CLIENT_ID = "892d24efb7be46eda64b117e84746469";
+const char* SPOTIFY_CLIENT_SECRET = "efc676374890412bb6dc7ae163f41539";
+String spotifyRefreshToken = "AQDn5CQ1ZSgR0vr03yCfr1zoCUJZaMeHHJKPJchF-b_q-OkUYEAtSdDOgTWcXVqlFk3OtW3NtpxZDiVIM8eHN0bs2M6WoPjn4WGRTypG89HcTEhdnxgpzMZg3269QZD3Ors";
+String spotifyAccessToken = "BQBu-O3IIOdIYLSIWNcAC-S4bepd7Ad7WSlMzSB7S9pjRlZfB0KMamXb27xUMogJZvhSNof5Zgjx5dEVf8QoSoHqomRTyPdijW9UMYK3d3JtbXR33mYBW5YkXqtqPqAPmSTgTzBY96Dg87MY2gJfIhi74K4jR3CayGUohHaJXGG309vUpcNvB0AFhHTA7VusE2xlRGcWqdVqKkXPqq-5UV33moBt";
+unsigned long spotifyTokenExpiry = 0;  // timestamp (millis) when token expires
+
+// For controlling how often we fetch Spotify data:
+unsigned long spotifyLastFetchTime = 0;  // fetch every 5 seconds
+
+// ----- New Global Variables for Spotify Volume Control -----
+int pendingVolumeDelta = 0;  
+unsigned long lastVolumeUpdateTime = 0;
+const unsigned long volumeUpdateInterval = 200;  // 200ms delay
+
+// ----- New Global Variables for Spotify Scrolling -----
+// These variables control horizontal scrolling for artist and title.
+int artistScrollX = 0;
+int titleScrollX = 0;
+unsigned long lastArtistScrollTime = 0;
+unsigned long lastTitleScrollTime = 0;
+const unsigned long scrollDelay = 150; // delay (ms) between scroll steps
+
 // ----- State Machine -----
-// Main menu options: FOCUS, STOPWATCH, ANIMATION, STONKS, IDLE  
-// FOCUS submenu: START, COUNTDOWN, BACK.
+// Main menu options: FOCUS, STOPWATCH, ANIMATION, STONKS, IDLE, SPOTIFY  
 enum State {
   MAIN_MENU,
   FOCUS_MENU,
@@ -34,15 +59,17 @@ enum State {
   FOCUS_COUNTDOWN_SELECT, // Adjust countdown minutes (default 20)
   FOCUS_COUNTDOWN_RUN,    // Countdown timer running (MM:SS with progress bar)
   STOPWATCH_RUN,          // Stopwatch mode (MM:SS)
+  STOPWATCH_PAUSED,       // Stopwatch paused state
   ANIMATION_RUN,          // Animation mode (cycles through animations)
   STONKS_RUN,             // STONKS mode (display stock data)
+  SPOTIFY_RUN,            // Spotify mode (display current track & control playback)
   IDLE_MODE               // Idle mode (full-screen date/time)
 };
 State currentState = MAIN_MENU;
 
 // ----- Menu Variables -----
-String mainMenuOptions[] = {"FOCUS", "STOPWATCH", "ANIMATION", "STONKS", "IDLE"};
-const int mainMenuCount = 5;
+String mainMenuOptions[] = {"FOCUS", "STOPWATCH", "ANIMATION", "STONKS", "IDLE", "SPOTIFY"};
+const int mainMenuCount = 6;
 int mainMenuIndex = 0;
 
 String focusMenuOptions[] = {"START", "COUNTDOWN", "BACK"};
@@ -50,18 +77,11 @@ const int focusMenuCount = 3;
 int focusMenuIndex = 0;
 
 // ----- Timer Variables -----
-// For FOCUS_START (count-up timer) in seconds
 unsigned long focusTimerSeconds = 0;
-
-// For FOCUS_COUNTDOWN: selectable minutes (default 20) then countdown (in seconds)
 int focusCountdownMinutes = 20;
 int countdownRemaining = 0;      // in seconds
 int initialCountdownSeconds = 0; // for progress bar
-
-// For STOPWATCH_RUN (in seconds)
 unsigned long stopwatchSeconds = 0;
-
-// Common variable for 1-second timing updates:
 unsigned long timerPreviousMillis = 0;
 
 // ----- Rotary Encoder & Button Debounce -----
@@ -70,18 +90,11 @@ unsigned long lastRotaryTime = 0;
 const unsigned long rotaryDebounceDelay = 150;
 
 // ----- Global Variables for ANIMATION_RUN -----
-// We'll cycle through three animations.
 int currentAnimationIndex = 0;
 unsigned long animationSwitchTime = 0;
 const int totalAnimations = 3;
-
-// Animation 1: Bouncing ball
 int ballX = 0, ballY = 0;
 int ballVX = 2, ballVY = 2;
-
-// Animation 2: Random dots (no extra globals needed)
-
-// Animation 3: Falling circles
 const int numCircles = 5;
 int circleX[numCircles];
 int circleY[numCircles];
@@ -93,12 +106,22 @@ const char* stockSymbols[] = {"NVDA", "AAPL", "MSFT"};
 const char* stockNames[]   = {"NVIDIA", "APPLE", "MICROSOFT"};
 const int numStocks = 3;
 int stonksIndex = 0;
-unsigned long stonksLastUpdateTime = 0; // used for auto-cycle (30 seconds)
+unsigned long stonksLastUpdateTime = 0; // auto-cycle (30 seconds)
 bool stonksFetched = false;
 float stonksCurrentPrice = 0.0;
 float stonksPercentChange = 0.0;
 
-// Custom 8x8 bitmap for an up arrow
+// ----- Global Variables for SPOTIFY_RUN -----
+String spotifyTrackName = "";
+String spotifyArtist = "";
+bool spotifyIsPlaying = false;
+int spotifyVolume = 50;  // volume percent
+unsigned long lastSpotifyButtonTime = 0;
+int spotifyClickCount = 0;
+const unsigned long spotifyDoubleClickTime = 500; // ms
+const unsigned long spotifyLongPressTime = 1000;    // ms
+
+// ----- Custom Bitmaps for Arrows (used in STONKS mode) -----
 const unsigned char upArrowBitmap[] PROGMEM = {
   0b00011000,
   0b00111100,
@@ -109,8 +132,6 @@ const unsigned char upArrowBitmap[] PROGMEM = {
   0b00011000,
   0b00011000
 };
-
-// Custom 8x8 bitmap for a down arrow
 const unsigned char downArrowBitmap[] PROGMEM = {
   0b00011000,
   0b00011000,
@@ -136,28 +157,82 @@ void animationFallingCircles();
 void fetchStonksData();
 void updateStonksDisplay();
 
+void refreshSpotifyToken();
+void fetchSpotifyData();
+void updateSpotifyDisplay();
+void adjustSpotifyVolume(int delta);
+void toggleSpotifyPlayback();
+void skipSpotifyTrack();
+void processSpotifyClick();
+
 void handleRotaryInput();
 void checkButtonAction();
 void handleCounting();
 void handleInactivity();
+void updateSpotifyVolumeIfNeeded();
 
+// ----- Spotify Token Refresh Function -----
+void refreshSpotifyToken() {
+  Serial.println("Refreshing Spotify access token...");
+  HTTPClient http;
+  String url = "https://accounts.spotify.com/api/token";
+  
+  WiFiClientSecure client;
+  client.setInsecure();
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  
+  String postData = "grant_type=refresh_token&refresh_token=" + spotifyRefreshToken;
+  String credentials = String(SPOTIFY_CLIENT_ID) + ":" + String(SPOTIFY_CLIENT_SECRET);
+  String encodedCredentials = base64::encode(credentials);
+  http.addHeader("Authorization", "Basic " + encodedCredentials);
+  
+  int httpCode = http.POST(postData);
+  if (httpCode == 200) {
+    String payload = http.getString();
+    Serial.print("Refresh payload: ");
+    Serial.println(payload);
+    int idxToken = payload.indexOf("\"access_token\":\"");
+    if (idxToken != -1) {
+      int start = idxToken + 16;
+      int end = payload.indexOf("\"", start);
+      spotifyAccessToken = payload.substring(start, end);
+      Serial.print("New Spotify Access Token: ");
+      Serial.println(spotifyAccessToken);
+    }
+    int idxExpires = payload.indexOf("\"expires_in\":");
+    if (idxExpires != -1) {
+      int start = idxExpires + 13;
+      int end = payload.indexOf(",", start);
+      if (end == -1) end = payload.indexOf("}", start);
+      String expiresStr = payload.substring(start, end);
+      int expiresIn = expiresStr.toInt();
+      spotifyTokenExpiry = millis() + expiresIn * 1000;
+      Serial.print("Token expires in: ");
+      Serial.print(expiresIn);
+      Serial.println(" seconds");
+    }
+  } else {
+    Serial.print("Spotify token refresh failed: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+  http.end();
+}
 
 // ----- WiFi & Time Setup -----
-// Attempts to connect for up to 10 seconds; if it fails, displays an error and retries.
 void setupWiFiAndTime() {
   Serial.println("Connecting to WiFi...");
   WiFi.begin(ssid, password);
   unsigned long startAttemptTime = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
     delay(500);
-    Serial.print(".");
+    Serial.print("...");
   }
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi connected.");
-    // Set timezone for Madrid – force standard time = UTC+2
-    setenv("TZ", "CET-2CEST,M3.5.0/2,M10.5.0/3", 1);
+    // Madrid: standard time UTC+1, DST UTC+2.
+    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
     tzset();
-    // Sync time via NTP (offsets 0,0 because TZ is set)
     configTime(0, 0, "pool.ntp.org");
     Serial.println("Waiting for NTP time sync...");
     time_t now = time(nullptr);
@@ -179,7 +254,7 @@ void setupWiFiAndTime() {
     display.print("Retrying in 10s...");
     display.display();
     delay(10000);
-    setupWiFiAndTime(); // Retry recursively
+    setupWiFiAndTime();
   }
 }
 
@@ -188,12 +263,10 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n=== Booting Device ===");
   
-  // Initialize pins for rotary encoder & button
   pinMode(CLK, INPUT);
   pinMode(DT, INPUT);
   pinMode(SW, INPUT_PULLUP);
   
-  // Initialize OLED display
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("SSD1306 allocation failed");
     for(;;);
@@ -221,46 +294,64 @@ void setup() {
 
 // ----- Main Loop -----
 void loop() {
-  // STONKS mode: Auto-cycle every 30 seconds if no input.
+  // STONKS mode: cycle through stocks every 30 seconds.
   if (currentState == STONKS_RUN) {
-    if (!stonksFetched) {
-      fetchStonksData();
-      stonksLastUpdateTime = millis();
-      updateStonksDisplay();
-    } else if (millis() - stonksLastUpdateTime > 30000) {
+    if (millis() - stonksLastUpdateTime > 30000) {
       stonksIndex = (stonksIndex + 1) % numStocks;
-      stonksFetched = false;
       stonksLastUpdateTime = millis();
+      stonksFetched = false;
+      fetchStonksData();
+      updateStonksDisplay();
     }
   }
   
-  // ANIMATION mode: run the current animation.
+  // ANIMATION mode:
   if (currentState == ANIMATION_RUN) {
     runAnimation();
+  }
+  
+  // SPOTIFY mode:
+  if (currentState == SPOTIFY_RUN) {
+    if (millis() - spotifyLastFetchTime > 5000) {
+      if (millis() > spotifyTokenExpiry - 30000) {
+        refreshSpotifyToken();
+      }
+      fetchSpotifyData();
+      spotifyLastFetchTime = millis();
+    }
+    updateSpotifyVolumeIfNeeded();
+    updateSpotifyDisplay();
   }
   
   handleRotaryInput();
   checkButtonAction();
   handleCounting();
-  handleInactivity();
+  // Do not trigger auto-idle when in STONKS or SPOTIFY mode.
+  if (currentState != STONKS_RUN && currentState != SPOTIFY_RUN)
+    handleInactivity();
   
-  // In IDLE mode, update full-screen date/time frequently.
   if (currentState == IDLE_MODE) {
     updateDisplayIDLE();
   }
+  
+  // In SPOTIFY_RUN, process click timing for single vs. double click:
+  if (currentState == SPOTIFY_RUN) {
+    if (spotifyClickCount > 0 && (millis() - lastSpotifyButtonTime > spotifyDoubleClickTime)) {
+      processSpotifyClick();
+    }
+  }
 }
 
-// ----- Display Update (for MAIN_MENU, FOCUS, STOPWATCH, etc.) -----
-// Header (current date/time) is centered.
+// ----- Display Update for Menus & Timer Modes -----
 void updateDisplay() {
   Serial.print("updateDisplay() called, state: ");
   Serial.println(currentState);
   
   display.clearDisplay();
   if (currentState == IDLE_MODE) return;
-  if (currentState == STONKS_RUN) return; // STONKS uses its own display update
+  if (currentState == STONKS_RUN) return;
+  if (currentState == SPOTIFY_RUN) return;
   
-  // Draw header: current date/time in "HH:MM | DD.MM", centered.
   String header = getCurrentDateTime();
   display.setTextSize(1);
   int headerWidth = header.length() * 6;
@@ -269,7 +360,6 @@ void updateDisplay() {
   display.setTextColor(WHITE);
   display.print(header);
   
-  // Main text:
   display.setTextSize(2);
   String mainText = "";
   if (currentState == MAIN_MENU) {
@@ -284,6 +374,8 @@ void updateDisplay() {
     mainText = formatTime(countdownRemaining);
   } else if (currentState == STOPWATCH_RUN) {
     mainText = formatTime(stopwatchSeconds);
+  } else if (currentState == STOPWATCH_PAUSED) {
+    mainText = formatTime(stopwatchSeconds) + " PAUSED";
   }
   
   int textWidth = mainText.length() * 12;
@@ -292,7 +384,6 @@ void updateDisplay() {
   display.setCursor(x, y);
   display.print(mainText);
   
-  // For FOCUS_COUNTDOWN_RUN, draw progress bar at bottom.
   if (currentState == FOCUS_COUNTDOWN_RUN && initialCountdownSeconds > 0) {
     float progress = float(initialCountdownSeconds - countdownRemaining) / initialCountdownSeconds;
     int barWidth = progress * SCREEN_WIDTH;
@@ -305,7 +396,6 @@ void updateDisplay() {
 }
 
 // ----- Idle Mode Display -----
-// Displays full date (DD.MM.YYYY) at the top (small, centered) and time (HH:MM) below (large).
 void updateDisplayIDLE() {
   display.clearDisplay();
   time_t now = time(nullptr);
@@ -316,7 +406,6 @@ void updateDisplayIDLE() {
   char timeBuffer[10];
   sprintf(timeBuffer, "%02d:%02d", timeinfo->tm_hour, timeinfo->tm_min);
   
-  // Draw date in small font, centered.
   display.setTextSize(1);
   int dateWidth = strlen(dateBuffer) * 6;
   int dateX = (SCREEN_WIDTH - dateWidth) / 2;
@@ -324,7 +413,6 @@ void updateDisplayIDLE() {
   display.setTextColor(WHITE);
   display.print(dateBuffer);
   
-  // Draw time in larger font, centered.
   display.setTextSize(3);
   int timeWidth = strlen(timeBuffer) * 18;
   int timeX = (SCREEN_WIDTH - timeWidth) / 2;
@@ -357,8 +445,6 @@ String getCurrentDateTime() {
 }
 
 // ----- ANIMATION Functions -----
-// Three animations: bouncing ball, random dots, falling circles.
-
 void animationBouncingBall() {
   ballX += ballVX;
   ballY += ballVY;
@@ -397,7 +483,6 @@ void animationFallingCircles() {
 }
 
 void runAnimation() {
-  // Auto-cycle animations every 30 seconds.
   if (millis() - animationSwitchTime > 30000) {
     currentAnimationIndex = (currentAnimationIndex + 1) % totalAnimations;
     animationSwitchTime = millis();
@@ -420,7 +505,6 @@ void runAnimation() {
 }
 
 // ----- STONKS Functions -----
-// We now fetch stock data only on entry or when the user scrolls in STONKS mode.
 void fetchStonksData() {
   HTTPClient http;
   String url = "https://finnhub.io/api/v1/quote?symbol=";
@@ -431,8 +515,8 @@ void fetchStonksData() {
   Serial.println(url);
   
   WiFiClientSecure client;
-  client.setInsecure();  // Disable certificate verification for simplicity
-  http.begin(client, url);  // Use secure client for HTTPS
+  client.setInsecure();
+  http.begin(client, url);
   
   int httpCode = http.GET();
   if (httpCode > 0) {
@@ -442,7 +526,6 @@ void fetchStonksData() {
     Serial.print("Payload: ");
     Serial.println(payload);
     
-    // Parse current price "c"
     int idxC = payload.indexOf("\"c\":");
     if (idxC != -1) {
       int start = idxC + 4;
@@ -450,7 +533,6 @@ void fetchStonksData() {
       String cStr = payload.substring(start, end);
       stonksCurrentPrice = cStr.toFloat();
     }
-    // Parse percent change "dp"
     int idxDP = payload.indexOf("\"dp\":");
     if (idxDP != -1) {
       int start = idxDP + 5;
@@ -472,7 +554,6 @@ void fetchStonksData() {
   http.end();
 }
 
-
 void updateStonksDisplay() {
   display.clearDisplay();
   String stockName = stockNames[stonksIndex];
@@ -482,8 +563,7 @@ void updateStonksDisplay() {
   display.setCursor(nameX, 0);
   display.setTextColor(WHITE);
   display.print(stockName);
-
-  // Display current price with "$"
+  
   char priceBuffer[10];
   sprintf(priceBuffer, "%.2f$", stonksCurrentPrice);
   display.setTextSize(2);
@@ -491,31 +571,222 @@ void updateStonksDisplay() {
   int priceX = (SCREEN_WIDTH - priceWidth) / 2;
   display.setCursor(priceX, 26);
   display.print(priceBuffer);
-
-  // Decide which arrow bitmap to use based on percent change
-  const unsigned char* arrowBitmap;
-  if (stonksPercentChange >= 0) {
-    arrowBitmap = upArrowBitmap;
-  } else {
-    arrowBitmap = downArrowBitmap;
-  }
-  // Draw the arrow bitmap at a fixed position (e.g., x = 10, y = 46)
+  
+  const unsigned char* arrowBitmap = (stonksPercentChange >= 0) ? upArrowBitmap : downArrowBitmap;
   display.drawBitmap(10, 46, arrowBitmap, 8, 8, WHITE);
-
-  // Display the percent change next to the arrow.
+  
   char changeBuffer[10];
   sprintf(changeBuffer, "%.2f%%", fabs(stonksPercentChange));
   display.setTextSize(2);
   int changeWidth = strlen(changeBuffer) * 12;
-  int changeX = 20; // Draw right of the arrow
+  int changeX = 20;
   display.setCursor(changeX, 46);
   display.print(changeBuffer);
-
+  
   display.display();
   Serial.print("STONKS display updated for ");
   Serial.println(stockName);
 }
 
+// ----- SPOTIFY Functions -----
+// Now uses ArduinoJson to parse the "item" object.
+// Additionally, if the artist name is longer than 10 characters or track title longer than 8,
+// the text will scroll horizontally.
+void fetchSpotifyData() {
+  if (millis() > spotifyTokenExpiry - 30000) {
+    refreshSpotifyToken();
+  }
+  
+  HTTPClient http;
+  String url = "https://api.spotify.com/v1/me/player/currently-playing";
+  Serial.print("Fetching Spotify data from: ");
+  Serial.println(url);
+  
+  WiFiClientSecure client;
+  client.setInsecure();
+  http.begin(client, url);
+  http.addHeader("Authorization", "Bearer " + spotifyAccessToken);
+  int httpCode = http.GET();
+  if (httpCode == 200) {
+    String payload = http.getString();
+    Serial.print("Spotify HTTP code: ");
+    Serial.println(httpCode);
+    Serial.print("Payload length: ");
+    Serial.println(payload.length());
+    if (payload.length() == 0) {
+      Serial.println("Payload is empty. Possibly no active playback.");
+      spotifyTrackName = "";
+      spotifyArtist = "";
+      spotifyIsPlaying = false;
+    } else {
+      StaticJsonDocument<1024> filter;
+      filter["item"]["name"] = true;
+      filter["item"]["artists"][0]["name"] = true;
+      filter["is_playing"] = true;
+      
+      DynamicJsonDocument doc(2048);
+      DeserializationError error = deserializeJson(doc, payload, DeserializationOption::Filter(filter));
+      if (error) {
+        Serial.print("deserializeJson() failed: ");
+        Serial.println(error.c_str());
+        spotifyTrackName = "";
+        spotifyArtist = "";
+      } else {
+        JsonObject item = doc["item"];
+        if (!item.isNull()) {
+          spotifyTrackName = item["name"].as<String>();
+          JsonArray artists = item["artists"];
+          if (!artists.isNull() && artists.size() > 0) {
+            spotifyArtist = artists[0]["name"].as<String>();
+          } else {
+            spotifyArtist = "";
+          }
+        } else {
+          spotifyTrackName = "";
+          spotifyArtist = "";
+        }
+        spotifyIsPlaying = doc["is_playing"].as<bool>();
+      }
+    }
+  } else {
+    Serial.print("Spotify GET failed: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+  http.end();
+}
+
+void updateSpotifyDisplay() {
+  display.clearDisplay();
+  // Animate artist if longer than 10 characters; otherwise, center it.
+  display.setTextSize(1);
+  String artistText = spotifyArtist;
+  if (artistText.length() == 0)
+    artistText = "No Artist";
+  
+  int artistDisplayWidth = artistText.length() * 6;
+  // If the artist text is wider than SCREEN_WIDTH and longer than 10 characters, scroll it.
+  if (artistText.length() > 10 && artistDisplayWidth > SCREEN_WIDTH) {
+    // Update the scroll offset
+    if (millis() - lastArtistScrollTime > scrollDelay) {
+      artistScrollX--;
+      lastArtistScrollTime = millis();
+    }
+    // Reset when fully scrolled out
+    if (artistScrollX < -artistDisplayWidth)
+      artistScrollX = SCREEN_WIDTH;
+  } else {
+    // Center if not animating
+    artistScrollX = (SCREEN_WIDTH - artistDisplayWidth) / 2;
+  }
+  display.setCursor(artistScrollX, 0);
+  display.setTextColor(WHITE);
+  display.print(artistText);
+  
+  // Animate track title if longer than 8 characters; otherwise, center it.
+  display.setTextSize(2);
+  String titleText = spotifyTrackName;
+  if (titleText.length() == 0)
+    titleText = "No Track";
+  
+  int titleDisplayWidth = titleText.length() * 12;
+  if (titleText.length() > 8 && titleDisplayWidth > SCREEN_WIDTH) {
+    if (millis() - lastTitleScrollTime > scrollDelay) {
+      titleScrollX--;
+      lastTitleScrollTime = millis();
+    }
+    if (titleScrollX < -titleDisplayWidth)
+      titleScrollX = SCREEN_WIDTH;
+  } else {
+    titleScrollX = (SCREEN_WIDTH - titleDisplayWidth) / 2;
+  }
+  display.setCursor(titleScrollX, 16);
+  display.print(titleText);
+  
+  display.display();
+}
+
+void adjustSpotifyVolume(int delta) {
+  pendingVolumeDelta += delta;
+}
+
+void updateSpotifyVolumeIfNeeded() {
+  if (millis() - lastVolumeUpdateTime > volumeUpdateInterval && pendingVolumeDelta != 0) {
+    spotifyVolume += pendingVolumeDelta;
+    if (spotifyVolume < 0) spotifyVolume = 0;
+    if (spotifyVolume > 100) spotifyVolume = 100;
+    
+    HTTPClient http;
+    String url = String("https://api.spotify.com/v1/me/player/volume?volume_percent=") + String(spotifyVolume);
+    WiFiClientSecure client;
+    client.setInsecure();
+    http.begin(client, url);
+    http.addHeader("Authorization", "Bearer " + spotifyAccessToken);
+    int httpCode = http.PUT("");
+    if (httpCode == 204) {
+      Serial.print("Spotify volume set to ");
+      Serial.println(spotifyVolume);
+    } else {
+      Serial.print("Failed to set Spotify volume: ");
+      Serial.println(http.errorToString(httpCode));
+    }
+    http.end();
+    pendingVolumeDelta = 0;
+    lastVolumeUpdateTime = millis();
+  }
+}
+
+void toggleSpotifyPlayback() {
+  HTTPClient http;
+  String url;
+  if (spotifyIsPlaying) {
+    url = "https://api.spotify.com/v1/me/player/pause";
+  } else {
+    url = "https://api.spotify.com/v1/me/player/play";
+  }
+  WiFiClientSecure client;
+  client.setInsecure();
+  http.begin(client, url);
+  http.addHeader("Authorization", "Bearer " + spotifyAccessToken);
+  int httpCode = http.PUT("");
+  if (httpCode == 204) {
+    Serial.println("Spotify playback toggled.");
+    spotifyIsPlaying = !spotifyIsPlaying;
+  } else {
+    Serial.print("Failed to toggle Spotify playback: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+  http.end();
+}
+
+void skipSpotifyTrack() {
+  HTTPClient http;
+  String url = "https://api.spotify.com/v1/me/player/next";
+  WiFiClientSecure client;
+  client.setInsecure();
+  http.begin(client, url);
+  http.addHeader("Authorization", "Bearer " + spotifyAccessToken);
+  int httpCode = http.POST("");
+  if (httpCode == 204) {
+    Serial.println("Skipped to next Spotify track.");
+  } else {
+    Serial.print("Failed to skip Spotify track: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+  http.end();
+}
+
+void processSpotifyClick() {
+  if (spotifyClickCount >= 2) {
+    Serial.println("Spotify: Double click detected, skipping track.");
+    skipSpotifyTrack();
+  } else {
+    Serial.println("Spotify: Single click detected, toggling play/pause.");
+    toggleSpotifyPlayback();
+  }
+  spotifyClickCount = 0;
+  fetchSpotifyData();
+  updateSpotifyDisplay();
+}
 
 // ----- Handle Rotary Encoder Input -----
 int getRotation() {
@@ -536,23 +807,24 @@ void handleRotaryInput() {
   if (rotation != 0) {
     Serial.print("Rotary input: ");
     Serial.println(rotation);
-    lastInputTime = millis(); // update activity
-
-    // In IDLE, ANIMATION, or STONKS mode, any rotary input exits (in STONKS mode, rotary cycles stock).
-    if (currentState == IDLE_MODE) {
-      Serial.println("Exiting IDLE mode via rotary input.");
+    lastInputTime = millis();
+    
+    // In IDLE or ANIMATION mode, exit to MAIN_MENU.
+    if (currentState == IDLE_MODE || currentState == ANIMATION_RUN) {
+      Serial.println("Exiting current mode via rotary input.");
       currentState = MAIN_MENU;
       updateDisplay();
       return;
     }
-    if (currentState == ANIMATION_RUN) {
-      Serial.println("Exiting ANIMATION mode via rotary input.");
-      currentState = MAIN_MENU;
-      updateDisplay();
+    // In SPOTIFY mode, adjust volume.
+    if (currentState == SPOTIFY_RUN) {
+      adjustSpotifyVolume(rotation * 5);
+      updateSpotifyVolumeIfNeeded();
+      fetchSpotifyData();
+      updateSpotifyDisplay();
       return;
     }
     if (currentState == STONKS_RUN) {
-      // In STONKS mode, rotary input cycles to the next stock.
       stonksIndex = (stonksIndex + rotation + numStocks) % numStocks;
       stonksFetched = false;
       stonksLastUpdateTime = millis();
@@ -561,22 +833,17 @@ void handleRotaryInput() {
       return;
     }
     
-    // MAIN_MENU: adjust selection.
     if (currentState == MAIN_MENU) {
       mainMenuIndex = (mainMenuIndex + rotation + mainMenuCount) % mainMenuCount;
       Serial.print("Main menu index: ");
       Serial.println(mainMenuIndex);
       updateDisplay();
-    }
-    // FOCUS_MENU: adjust submenu selection.
-    else if (currentState == FOCUS_MENU) {
+    } else if (currentState == FOCUS_MENU) {
       focusMenuIndex = (focusMenuIndex + rotation + focusMenuCount) % focusMenuCount;
       Serial.print("Focus menu index: ");
       Serial.println(focusMenuIndex);
       updateDisplay();
-    }
-    // FOCUS_COUNTDOWN_SELECT: adjust countdown minutes.
-    else if (currentState == FOCUS_COUNTDOWN_SELECT) {
+    } else if (currentState == FOCUS_COUNTDOWN_SELECT) {
       focusCountdownMinutes = max(1, focusCountdownMinutes + rotation);
       Serial.print("Focus countdown minutes: ");
       Serial.println(focusCountdownMinutes);
@@ -591,25 +858,24 @@ void checkButtonAction() {
     delay(buttonDebounceDelay);
     if (digitalRead(SW) == LOW) {
       Serial.println("Button pressed.");
-      lastInputTime = millis(); // update activity
+      lastInputTime = millis();
       
       switch (currentState) {
         case MAIN_MENU:
-          if (mainMenuIndex == 0) {  // FOCUS
+          if (mainMenuIndex == 0) {
             currentState = FOCUS_MENU;
             focusMenuIndex = 0;
             Serial.println("Entering FOCUS menu.");
-          } else if (mainMenuIndex == 1) {  // STOPWATCH
+          } else if (mainMenuIndex == 1) {
             currentState = STOPWATCH_RUN;
             stopwatchSeconds = 0;
             timerPreviousMillis = millis();
             Serial.println("Starting STOPWATCH.");
-          } else if (mainMenuIndex == 2) {  // ANIMATION
+          } else if (mainMenuIndex == 2) {
             currentState = ANIMATION_RUN;
             ballX = random(0, SCREEN_WIDTH - 4);
             ballY = random(0, SCREEN_HEIGHT - 4);
             ballVX = 2; ballVY = 2;
-            // Reset falling circles:
             for (int i = 0; i < numCircles; i++) {
               circleX[i] = random(0, SCREEN_WIDTH);
               circleY[i] = random(-SCREEN_HEIGHT, 0);
@@ -618,7 +884,7 @@ void checkButtonAction() {
             animationSwitchTime = millis();
             currentAnimationIndex = 0;
             Serial.println("Entering ANIMATION mode.");
-          } else if (mainMenuIndex == 3) {  // STONKS
+          } else if (mainMenuIndex == 3) {
             currentState = STONKS_RUN;
             stonksIndex = 0;
             stonksFetched = false;
@@ -626,24 +892,35 @@ void checkButtonAction() {
             fetchStonksData();
             updateStonksDisplay();
             Serial.println("Entering STONKS mode.");
-          } else if (mainMenuIndex == 4) {  // IDLE
+          } else if (mainMenuIndex == 4) {
             currentState = IDLE_MODE;
             Serial.println("Entering IDLE mode (explicit).");
+          } else if (mainMenuIndex == 5) {
+            currentState = SPOTIFY_RUN;
+            spotifyLastFetchTime = 0;  // Force immediate fetch
+            // Reset scrolling positions for artist and title:
+            artistScrollX = 0;
+            titleScrollX = 0;
+            lastArtistScrollTime = millis();
+            lastTitleScrollTime = millis();
+            fetchSpotifyData();
+            updateSpotifyDisplay();
+            Serial.println("Entering SPOTIFY mode.");
           }
           updateDisplay();
           break;
           
         case FOCUS_MENU:
-          if (focusMenuIndex == 0) {  // START
+          if (focusMenuIndex == 0) {
             currentState = FOCUS_START;
             focusTimerSeconds = 0;
             timerPreviousMillis = millis();
             Serial.println("Starting FOCUS count-up timer.");
-          } else if (focusMenuIndex == 1) {  // COUNTDOWN
+          } else if (focusMenuIndex == 1) {
             currentState = FOCUS_COUNTDOWN_SELECT;
             focusCountdownMinutes = 20;
             Serial.println("Entering FOCUS COUNTDOWN selection.");
-          } else if (focusMenuIndex == 2) {  // BACK
+          } else if (focusMenuIndex == 2) {
             currentState = MAIN_MENU;
             Serial.println("Returning to MAIN_MENU from FOCUS menu.");
           }
@@ -677,6 +954,12 @@ void checkButtonAction() {
           break;
           
         case STOPWATCH_RUN:
+          currentState = STOPWATCH_PAUSED;
+          Serial.println("Stopwatch paused.");
+          updateDisplay();
+          break;
+          
+        case STOPWATCH_PAUSED:
           Serial.print("Stopwatch stopped at: ");
           Serial.println(formatTime(stopwatchSeconds));
           currentState = MAIN_MENU;
@@ -699,6 +982,26 @@ void checkButtonAction() {
           Serial.println("Exiting ANIMATION mode via button.");
           currentState = MAIN_MENU;
           updateDisplay();
+          break;
+          
+        case SPOTIFY_RUN:
+          { // Handle Spotify button press with timing for single vs. double vs. long press.
+            unsigned long pressStart = millis();
+            while(digitalRead(SW) == LOW) { delay(10); }
+            unsigned long pressDuration = millis() - pressStart;
+            if (pressDuration >= spotifyLongPressTime) {
+              Serial.println("Spotify: Long press detected, exiting to MAIN_MENU.");
+              currentState = MAIN_MENU;
+              updateDisplay();
+            } else {
+              if (millis() - lastSpotifyButtonTime < spotifyDoubleClickTime) {
+                spotifyClickCount++;
+              } else {
+                spotifyClickCount = 1;
+              }
+              lastSpotifyButtonTime = millis();
+            }
+          }
           break;
           
         default:
@@ -744,12 +1047,13 @@ void handleCounting() {
 }
 
 // ----- Handle Inactivity -----
+// Auto-idle only if in a menu/submenu (excluding STONKS and SPOTIFY).
 void handleInactivity() {
-  // Only trigger auto-idle if the user is in a menu/submenu:
-  if ((currentState == MAIN_MENU || currentState == FOCUS_MENU || currentState == FOCUS_COUNTDOWN_SELECT) &&
+  if ((currentState == MAIN_MENU || currentState == FOCUS_MENU || currentState == FOCUS_COUNTDOWN_SELECT || currentState == STONKS_RUN) &&
       (millis() - lastInputTime > inactivityTimeout)) {
     Serial.println("No input for 60s in a menu; entering IDLE mode.");
     currentState = IDLE_MODE;
     updateDisplay();
   }
 }
+
