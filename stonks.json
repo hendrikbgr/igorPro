@@ -10,5 +10,29 @@
     {
         "short": "MSFT",
         "name": "MICROSOFT"
+    },
+    {
+        "short": "GOOGL",
+        "name": "ALPHABET"
+    },
+    {
+        "short": "AMZN",
+        "name": "AMAZON"
+    },
+    {
+        "short": "TSLA",
+        "name": "TESLA"
+    },
+    {
+        "short": "META",
+        "name": "META"
+    },
+    {
+        "short": "NFLX",
+        "name": "NETFLIX"
+    },
+    {
+        "short": "ANGI",
+        "name": "ANGI"
     }
 ]
